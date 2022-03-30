@@ -2,7 +2,11 @@ module github.com/letsencrypt/ctcrawl
 
 go 1.18
 
-require github.com/google/certificate-transparency-go v1.1.2
+require (
+	github.com/go-sql-driver/mysql v1.6.0
+	github.com/google/certificate-transparency-go v1.1.2
+	github.com/google/trillian v1.4.0
+)
 
 require (
 	bitbucket.org/creachadair/shell v0.0.6 // indirect
@@ -28,7 +32,6 @@ require (
 	github.com/golang/mock v1.6.0 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/google/btree v1.0.1 // indirect
-	github.com/google/trillian v1.4.0 // indirect
 	github.com/gorilla/websocket v1.4.2 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.3.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0 // indirect
