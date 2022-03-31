@@ -6,9 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"time"
 
@@ -35,48 +35,110 @@ func (ed entryData) Before(other entryData) bool {
 	return ed.index < other.index
 }
 
-func showHash(h []byte) string {
+func b64(h []byte) string {
 	return base64.StdEncoding.EncodeToString(h)
+}
+
+func runFetcher(fetcher *scanner.Fetcher) <-chan entryData {
+	entries := make(chan entryData)
+	go func() {
+		err := fetcher.Run(context.Background(), func(batch scanner.EntryBatch) {
+			for i, e := range batch.Entries {
+				h := sha256.New()
+				h.Write([]byte{0})
+				h.Write(e.LeafInput)
+				entries <- entryData{index: batch.Start + int64(i), merkleLeafHash: h.Sum(nil)}
+			}
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		close(entries)
+	}()
+	return entries
+}
+
+// sorted starts a goroutine that reads entryData from its input, and emits
+// them in sorted order (by increasing index) on the output channel it returns.
+func sorter(entries <-chan entryData) <-chan entryData {
+	sortedEntries := make(chan entryData)
+	buffer := NewHeap[entryData]()
+	go func() {
+		var nextIndex int64 = 0
+		for e := range entries {
+			buffer.Push(e)
+
+			for buffer.Len() > 0 && buffer.Peek().index == nextIndex {
+				e = buffer.Pop()
+				sortedEntries <- e
+				nextIndex += 1
+			}
+		}
+		close(sortedEntries)
+	}()
+	return sortedEntries
+}
+
+// verify requests `get-proof-by-hash` for a given entry and calculates the
+// root hash based on the returned audit_path plus the entry's hash. It then
+// compares that against a currently-calculated root hash. This provides a way
+// to do partial consistency checks along the way to verifying a full root hash
+// from scratch. It also ensures that if the log is serving get-proof-by-hash
+// requests using precalculated hashes, those precalculated hashes have not
+// been corrupted.
+func verify(logClient *client.LogClient, e entryData, rootHash []byte) error {
+	currentTreeSize := e.index + 1
+	pbh, err := logClient.GetProofByHash(context.Background(), e.merkleLeafHash, uint64(currentTreeSize))
+	if err != nil {
+		return fmt.Errorf("getting proof by hash: %w", err)
+	}
+
+	hasher := rfc6962.DefaultHasher
+	verifier := logverifier.New(hasher)
+	err = verifier.VerifyInclusionProof(e.index, currentTreeSize, pbh.AuditPath, rootHash, e.merkleLeafHash)
+	if err != nil {
+		var auditPathPrintable []string
+		for _, h := range pbh.AuditPath {
+			auditPathPrintable = append(auditPathPrintable, b64(h))
+		}
+		return fmt.Errorf("verify failed: VerifyInclusionProof(%d, %d, %s, %s, %s)=%w",
+			e.index, currentTreeSize, auditPathPrintable,
+			b64(rootHash), b64(e.merkleLeafHash), err)
+	}
+	return nil
 }
 
 func main() {
 	logURI := flag.String("log_uri", "https://oak.ct.letsencrypt.org/2022/", "CT log base URI")
 	batchSize := flag.Int("batch_size", 256, "Max number of entries to request per call to get-entries")
 	numWorkers := flag.Int("num_workers", 2, "Number of concurrent workers")
-	startIndex := flag.Int64("start_index", 0, "Log index to start scanning at")
-	// endIndex := flag.Int64("end_index", 0, "Log index to end scanning at (non-inclusive)")
-	// treeId := flag.Int64("tree_id", 0, "Tree ID for identification in the DB")
+	flag.Usage = func() {
+		fmt.Print(`This tool gets the current STH of a log, then fetches all
+entries up to that STH's tree_size, building the root hash as it goes. If the
+root hash doesn't match, it exits with an error.
+
+It also checks get-proof-by-hash along the way, builds the implied root hash
+from the response, and checks that it matches the currently calculated root.
+If there's a mismatch, this tool exits with an error.
+
+`)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
-	// dsn := os.Getenv("DB")
-	// if dsn == "" {
-	// 	log.Fatal("$DB is unset; put a DB connection string in $DB")
-	// }
-	// db, err := sql.Open("mysql", os.Getenv("DB"))
-	// if err != nil {
-	// 	log.Fatal("opening DB: %w", err)
-	// }
-
-	// db.SetMaxIdleConns(*numWorkers)
-	// db.SetMaxOpenConns(*numWorkers)
-	// db.SetConnMaxLifetime(time.Minute)
+	if *logURI == "" {
+		log.Fatal("must provide the -log_uri flag")
+	}
 
 	logClient, err := client.New(*logURI, &http.Client{
 		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			MaxIdleConnsPerHost:   10,
-			DisableKeepAlives:     false,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
 	}, jsonclient.Options{UserAgent: "le-ct-crawler/0.1"})
 	if err != nil {
 		log.Fatalf("creating log client: %s", err)
 	}
 
+	// Fetch whatever the log is serving as the current STH. Currently we just
+	// trust the contents; we don't verify the signature.
 	sth, err := logClient.GetSTH(context.Background())
 	if err != nil {
 		log.Fatalf("getting STH: %s", err)
@@ -86,134 +148,73 @@ func main() {
 		time.Unix(0, int64(sth.Timestamp*1e6)), sth.SHA256RootHash.Base64String())
 	endIndex := int64(sth.TreeSize - 1)
 
-	hasher := rfc6962.DefaultHasher
-	verifier := logverifier.New(hasher)
-	fact := compact.RangeFactory{Hash: hasher.HashChildren}
-	compactRange := fact.NewEmptyRange(0)
-
 	fetcher := scanner.NewFetcher(
 		logClient,
 		&scanner.FetcherOptions{
 			BatchSize:     *batchSize,
-			StartIndex:    *startIndex,
+			StartIndex:    0,
 			EndIndex:      endIndex,
 			ParallelFetch: *numWorkers,
 			Continuous:    false,
 		},
 	)
 
-	// Create a callback that sends fetched entries to a channel to be processed.
-	entries := make(chan entryData)
-	sortedEntries := make(chan entryData)
+	// Fetch the entries as fast as possible
+	entries := runFetcher(fetcher)
+	// Filter them into sorted order
+	sortedEntries := sorter(entries)
 
-	// Start a worker which reads entries from the fetchers. If it receives an
-	// entry for which it has not already processed the immediately preceding
-	// entry, it buffers it and waits to process it until the intervening entries
-	// have been backfilled. When processing an entry, it compares it to the
-	// immediately prior entry: if the timestamp has traveled backwards in time,
-	// it outputs the *prior* entry, on the assumption that its timestamp was
-	// incorrectly forward in time.
-	buffer := NewHeap[entryData]()
-	go func() {
-		var nextIndex int64 = 0
-		for e := range entries {
-			buffer.Push(e)
+	hasher := rfc6962.DefaultHasher
+	compactRange := (&compact.RangeFactory{Hash: hasher.HashChildren}).NewEmptyRange(0)
 
-			// Try to process the buffer, just in case we've caught up to it.
-			for buffer.Len() > 0 && buffer.Peek().index == nextIndex {
-				e = buffer.Pop()
-				sortedEntries <- e
-				nextIndex += 1
-			}
-		}
-		close(sortedEntries)
-	}()
-
-	rootHashChan := make(chan []byte)
 	start := time.Now()
-	go func() {
-		var rootHash []byte
-		var err error
-		var e entryData
+	var rootHash []byte
+	var e entryData
+	for e = range sortedEntries {
+		compactRange.Append(e.merkleLeafHash, nil)
 		rootHash, err = compactRange.GetRootHash(nil)
 		if err != nil {
-			log.Fatal(err)
+			// The only way this could happen is if we didn't start
+			// the range at 0, which we definitely did.
+			log.Fatalf("index %d: %s", e.index, err)
 		}
-		for e = range sortedEntries {
-			compactRange.Append(e.merkleLeafHash, nil)
-			rootHash, err = compactRange.GetRootHash(nil)
-			if err != nil {
-				// The only way this could happen is if we didn't start
-				// the range at 0, which we definitely did, so it's okay to
-				// die here.
-				log.Fatalf("index %d: %s", e.index, err)
-			}
-			elapsed := time.Since(start).Seconds()
-			fraction := float64(e.index) / float64(endIndex)
-			rate := time.Duration(float64(e.index) / float64(elapsed))
-			var eta time.Duration
-			if rate > 0 {
-				eta = time.Duration(endIndex-e.index) / rate * time.Second
-			}
+		elapsed := time.Since(start).Seconds()
+		fraction := float64(e.index) / float64(endIndex)
+		rate := time.Duration(float64(e.index) / float64(elapsed))
+		var eta time.Duration
+		if rate > 0 {
+			eta = time.Duration(endIndex-e.index) / rate * time.Second
+		}
 
-			if e.index%98689 == 0 {
-				log.Printf("index %d of %d; %2.1f%%; ETA %s; leaf %s; root %s",
-					e.index,
-					endIndex,
-					fraction*100,
-					eta,
-					url.QueryEscape(showHash(e.merkleLeafHash)),
-					showHash(rootHash))
+		if e.index%98689 == 0 {
+			log.Printf("index %d of %d; %2.1f%%; ETA %s; leaf %s; root %s",
+				e.index, endIndex, fraction*100, eta,
+				b64(e.merkleLeafHash), b64(rootHash))
 
-				treeSize := e.index + 1
-				pbh, err := logClient.GetProofByHash(context.Background(), e.merkleLeafHash, uint64(treeSize))
+			go func(e entryData, rootHash []byte) {
+				err := verify(logClient, e, rootHash)
 				if err != nil {
-					log.Printf("getting proof by hash: %s", err)
+					log.Fatal(err)
 				}
-
-				err = verifier.VerifyInclusionProof(e.index, treeSize, pbh.AuditPath, rootHash, e.merkleLeafHash)
-				if err != nil {
-					var auditPathPrintable []string
-					for _, h := range pbh.AuditPath {
-						auditPathPrintable = append(auditPathPrintable, showHash(h))
-					}
-					log.Fatalf("Failed to VerifyInclusionProof(%d, %d, %s, %s, %s)=%s",
-						e.index, treeSize, auditPathPrintable,
-						showHash(rootHash), showHash(e.merkleLeafHash), err)
-				}
-			}
+			}(e, rootHash)
 		}
-		if e.index != endIndex-1 {
-			log.Printf("channel closed early? processed %d entries; expected %d", e.index, endIndex)
-		}
-		log.Printf("Final entry %d. Elapsed %s. Root hash %s",
-			e.index, time.Since(start), showHash(rootHash))
-		rootHashChan <- rootHash
-	}()
-
-	// Finally, run the fetcher, letting it feed data into the worker above.
-	err = fetcher.Run(context.Background(), func(batch scanner.EntryBatch) {
-		for i, e := range batch.Entries {
-			h := sha256.New()
-			h.Write([]byte{0})
-			h.Write(e.LeafInput)
-			entries <- entryData{index: batch.Start + int64(i), merkleLeafHash: h.Sum(nil)}
-		}
-	})
-	if err != nil {
-		log.Fatal(err)
 	}
-
-	close(entries)
-	rootHash := <-rootHashChan
+	if e.index != endIndex-1 {
+		log.Printf("channel closed early? processed %d entries; expected %d", e.index, endIndex)
+	}
+	log.Printf("Final entry %d. Elapsed %s. Root hash %s",
+		e.index, time.Since(start), b64(rootHash))
 	if !bytes.Equal(rootHash, sth.SHA256RootHash[:]) {
-		log.Printf(
+		log.Fatalf(
 			"calculated root hash differed from log's reported root hash at tree size %d: calculated %s, log reported %s",
 			sth.TreeSize,
-			showHash(rootHash),
-			showHash(sth.SHA256RootHash[:]))
-		os.Exit(1)
+			b64(rootHash),
+			b64(sth.SHA256RootHash[:]))
 	} else {
+		log.Fatalf(
+			"success: calculated root hash at tree size %d was an exact match for get-sth: %s",
+			sth.TreeSize,
+			b64(rootHash))
 		os.Exit(0)
 	}
 }
