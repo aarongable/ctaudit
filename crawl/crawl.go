@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/google/certificate-transparency-go/client"
@@ -17,7 +16,6 @@ import (
 	"github.com/google/certificate-transparency-go/scanner"
 	"github.com/google/trillian/merkle/compact"
 	"github.com/google/trillian/merkle/logverifier"
-
 	"github.com/google/trillian/merkle/rfc6962"
 )
 
@@ -56,9 +54,9 @@ func runFetcher(fetcher *scanner.Fetcher) <-chan entryData {
 	return entries
 }
 
-// sorted starts a goroutine that reads entryData from its input, and emits
+// runSorter starts a goroutine that reads entryData from its input, and emits
 // them in sorted order (by increasing index) on the output channel it returns.
-func sorter(entries <-chan entryData) <-chan entryData {
+func runSorter(entries <-chan entryData) <-chan entryData {
 	sortedEntries := make(chan entryData)
 	buffer := NewHeap[entryData]()
 	go func() {
@@ -79,11 +77,11 @@ func sorter(entries <-chan entryData) <-chan entryData {
 
 // verify requests `get-proof-by-hash` for a given entry and calculates the
 // root hash based on the returned audit_path plus the entry's hash. It then
-// compares that against a currently-calculated root hash. This provides a way
-// to do partial consistency checks along the way to verifying a full root hash
-// from scratch. It also ensures that if the log is serving get-proof-by-hash
-// requests using precalculated hashes, those precalculated hashes have not
-// been corrupted.
+// compares that against a root hash calculated by another method. This
+// provides a way to do partial consistency checks along the way to verifying
+// a full root hash from scratch. It also ensures that if the log is serving
+// get-proof-by-hash requests using precalculated hashes, those precalculated
+// hashes have not been corrupted.
 func verify(logClient *client.LogClient, e entryData, rootHash []byte) error {
 	currentTreeSize := e.index + 1
 	pbh, err := logClient.GetProofByHash(context.Background(), e.merkleLeafHash, uint64(currentTreeSize))
@@ -91,8 +89,7 @@ func verify(logClient *client.LogClient, e entryData, rootHash []byte) error {
 		return fmt.Errorf("getting proof by hash: %w", err)
 	}
 
-	hasher := rfc6962.DefaultHasher
-	verifier := logverifier.New(hasher)
+	verifier := logverifier.New(rfc6962.DefaultHasher)
 	err = verifier.VerifyInclusionProof(e.index, currentTreeSize, pbh.AuditPath, rootHash, e.merkleLeafHash)
 	if err != nil {
 		var auditPathPrintable []string
@@ -107,7 +104,7 @@ func verify(logClient *client.LogClient, e entryData, rootHash []byte) error {
 }
 
 func main() {
-	logURI := flag.String("log_uri", "https://oak.ct.letsencrypt.org/2022/", "CT log base URI")
+	logURI := flag.String("log_uri", "", "CT log base URI")
 	batchSize := flag.Int("batch_size", 256, "Max number of entries to request per call to get-entries")
 	numWorkers := flag.Int("num_workers", 2, "Number of concurrent workers")
 	flag.Usage = func() {
@@ -143,7 +140,7 @@ If there's a mismatch, this tool exits with an error.
 	}
 
 	log.Printf("verifying tree integrity at size %d (%s) with root hash %s", sth.TreeSize,
-		time.Unix(0, int64(sth.Timestamp*1e6)), sth.SHA256RootHash.Base64String())
+		time.UnixMilli(int64(sth.Timestamp)), sth.SHA256RootHash.Base64String())
 	endIndex := int64(sth.TreeSize - 1)
 
 	fetcher := scanner.NewFetcher(
@@ -160,10 +157,9 @@ If there's a mismatch, this tool exits with an error.
 	// Fetch the entries as fast as possible
 	entries := runFetcher(fetcher)
 	// Filter them into sorted order
-	sortedEntries := sorter(entries)
+	sortedEntries := runSorter(entries)
 
-	hasher := rfc6962.DefaultHasher
-	compactRange := (&compact.RangeFactory{Hash: hasher.HashChildren}).NewEmptyRange(0)
+	compactRange := (&compact.RangeFactory{Hash: rfc6962.DefaultHasher.HashChildren}).NewEmptyRange(0)
 
 	start := time.Now()
 	var rootHash []byte
@@ -184,6 +180,9 @@ If there's a mismatch, this tool exits with an error.
 			eta = time.Duration(endIndex-e.index) / rate * time.Second
 		}
 
+		// Sample by a medium-sized prime number so we're not always verifying
+		// at even-length tree sizes; this might give us more coverage of
+		// different kinds of paths through the tree.
 		if e.index%98689 == 0 {
 			log.Printf("index %d of %d; %2.1f%%; ETA %s; leaf %s; root %s",
 				e.index, endIndex, fraction*100, eta,
@@ -200,7 +199,7 @@ If there's a mismatch, this tool exits with an error.
 	if e.index != endIndex-1 {
 		log.Printf("channel closed early? processed %d entries; expected %d", e.index, endIndex)
 	}
-	log.Printf("Final entry %d. Elapsed %s. Root hash %s",
+	log.Printf("final entry %d. Elapsed %s. Root hash %s",
 		e.index, time.Since(start), b64(rootHash))
 	if !bytes.Equal(rootHash, sth.SHA256RootHash[:]) {
 		log.Fatalf(
@@ -208,11 +207,9 @@ If there's a mismatch, this tool exits with an error.
 			sth.TreeSize,
 			b64(rootHash),
 			b64(sth.SHA256RootHash[:]))
-	} else {
-		log.Fatalf(
-			"success: calculated root hash at tree size %d was an exact match for get-sth: %s",
-			sth.TreeSize,
-			b64(rootHash))
-		os.Exit(0)
 	}
+	log.Printf(
+		"success: calculated root hash at tree size %d was an exact match for get-sth: %s",
+		sth.TreeSize,
+		b64(rootHash))
 }
