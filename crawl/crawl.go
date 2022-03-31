@@ -19,8 +19,6 @@ import (
 	"github.com/google/trillian/merkle/logverifier"
 
 	"github.com/google/trillian/merkle/rfc6962"
-
-	_ "github.com/go-sql-driver/mysql"
 )
 
 // entryData contains the index / sequence number of an entry, as well as the
