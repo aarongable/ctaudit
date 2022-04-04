@@ -17,9 +17,9 @@ import (
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/scanner"
-	"github.com/google/trillian/merkle/compact"
-	"github.com/google/trillian/merkle/logverifier"
-	"github.com/google/trillian/merkle/rfc6962"
+	"github.com/transparency-dev/merkle"
+	"github.com/transparency-dev/merkle/compact"
+	"github.com/transparency-dev/merkle/rfc6962"
 )
 
 // entryData contains the index / sequence number of an entry, as well as the
@@ -104,8 +104,8 @@ func verify(logClient *client.LogClient, e entryData, rootHash []byte) error {
 		break
 	}
 
-	verifier := logverifier.New(rfc6962.DefaultHasher)
-	err = verifier.VerifyInclusionProof(e.index, currentTreeSize, pbh.AuditPath, rootHash, e.merkleLeafHash)
+	verifier := merkle.NewLogVerifier(rfc6962.DefaultHasher)
+	err = verifier.VerifyInclusion(uint64(e.index), uint64(currentTreeSize), e.merkleLeafHash, pbh.AuditPath, rootHash)
 	if err != nil {
 		var auditPathPrintable []string
 		for _, h := range pbh.AuditPath {
@@ -218,13 +218,15 @@ If there's a mismatch, this tool exits with an error.
 		e.index, time.Since(start), b64(rootHash))
 	if !bytes.Equal(rootHash, sth.SHA256RootHash[:]) {
 		log.Fatalf(
-			"calculated root hash differed from log's reported root hash at tree size %d: calculated %s, log reported %s",
+			"calculated root hash of %s differed from log's reported root hash at tree size %d: calculated %s, log reported %s",
+			*logURI,
 			sth.TreeSize,
 			b64(rootHash),
 			b64(sth.SHA256RootHash[:]))
 	}
 	log.Printf(
-		"success: calculated root hash at tree size %d was an exact match for get-sth: %s",
+		"success: calculated root hash of %s at tree size %d was an exact match for get-sth: %s",
+		*logURI,
 		sth.TreeSize,
 		b64(rootHash))
 }

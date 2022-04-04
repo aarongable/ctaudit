@@ -5,6 +5,7 @@ go 1.18
 require (
 	github.com/google/certificate-transparency-go v1.1.2
 	github.com/google/trillian v1.4.0
+	github.com/transparency-dev/merkle v0.0.0-20220401133819-3a5b1d72b2dd
 )
 
 require (
