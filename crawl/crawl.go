@@ -17,6 +17,7 @@ import (
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/scanner"
+	"github.com/google/trillian/client/backoff"
 	"github.com/transparency-dev/merkle"
 	"github.com/transparency-dev/merkle/compact"
 	"github.com/transparency-dev/merkle/rfc6962"
@@ -78,6 +79,13 @@ func runSorter(entries <-chan entryData) <-chan entryData {
 	return sortedEntries
 }
 
+var fetchBackoff = &backoff.Backoff{
+	Min:    1 * time.Second,
+	Max:    30 * time.Second,
+	Factor: 2,
+	Jitter: true,
+}
+
 // verify requests `get-proof-by-hash` for a given entry and calculates the
 // root hash based on the returned audit_path plus the entry's hash. It then
 // compares that against a root hash calculated by another method. This
@@ -89,19 +97,23 @@ func verify(logClient *client.LogClient, e entryData, rootHash []byte) error {
 	currentTreeSize := e.index + 1
 
 	var pbh *ct.GetProofByHashResponse
-	var err error
-	for {
+	err := fetchBackoff.Retry(context.Background(), func() error {
+		var err error
 		pbh, err = logClient.GetProofByHash(context.Background(), e.merkleLeafHash, uint64(currentTreeSize))
 		if err != nil {
 			var netError net.Error
-			if errors.As(err, &netError) && netError.Timeout() {
-				log.Printf("get-proof-by-hash: %s", err)
-				time.Sleep(3 * time.Second)
-				continue
+			var rspError jsonclient.RspError
+			if (errors.As(err, &netError) && netError.Timeout()) ||
+				errors.As(err, &rspError) && rspError.StatusCode > 500 {
+				log.Printf("get-proof-by-hash: %s (retrying)", err)
+				return backoff.RetriableErrorf("%w", err)
 			}
-			return fmt.Errorf("getting proof by hash: %w", err)
+			return fmt.Errorf("getting proof by hash: %#v", err)
 		}
-		break
+		return nil
+	})
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	verifier := merkle.NewLogVerifier(rfc6962.DefaultHasher)
