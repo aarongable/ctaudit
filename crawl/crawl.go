@@ -5,12 +5,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
+	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/scanner"
@@ -84,9 +87,21 @@ func runSorter(entries <-chan entryData) <-chan entryData {
 // hashes have not been corrupted.
 func verify(logClient *client.LogClient, e entryData, rootHash []byte) error {
 	currentTreeSize := e.index + 1
-	pbh, err := logClient.GetProofByHash(context.Background(), e.merkleLeafHash, uint64(currentTreeSize))
-	if err != nil {
-		return fmt.Errorf("getting proof by hash: %w", err)
+
+	var pbh *ct.GetProofByHashResponse
+	var err error
+	for {
+		pbh, err = logClient.GetProofByHash(context.Background(), e.merkleLeafHash, uint64(currentTreeSize))
+		if err != nil {
+			var netError net.Error
+			if errors.As(err, &netError) && netError.Timeout() {
+				log.Printf("get-proof-by-hash: %s", err)
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			return fmt.Errorf("getting proof by hash: %w", err)
+		}
+		break
 	}
 
 	verifier := logverifier.New(rfc6962.DefaultHasher)
@@ -141,7 +156,7 @@ If there's a mismatch, this tool exits with an error.
 
 	log.Printf("verifying tree integrity at size %d (%s) with root hash %s", sth.TreeSize,
 		time.UnixMilli(int64(sth.Timestamp)), sth.SHA256RootHash.Base64String())
-	endIndex := int64(sth.TreeSize - 1)
+	endIndex := int64(sth.TreeSize)
 
 	fetcher := scanner.NewFetcher(
 		logClient,
