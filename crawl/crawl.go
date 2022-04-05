@@ -1,178 +1,244 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
-	"os"
-	"os/signal"
-	"sync"
-	"syscall"
 	"time"
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/scanner"
+	"github.com/google/trillian/client/backoff"
+	"github.com/transparency-dev/merkle"
+	"github.com/transparency-dev/merkle/compact"
+	"github.com/transparency-dev/merkle/rfc6962"
 )
 
 // entryData contains the index / sequence number of an entry, as well as the
-// leaf data contained at that index. It also implements the Orderable interface
+// leaf input contained at that index. It also implements the Orderable interface
 // so that it can be used in a Heap.
 type entryData struct {
-	index int64
-	entry *ct.RawLogEntry
+	index          int64
+	merkleLeafHash []byte
 }
 
 func (ed entryData) Before(other entryData) bool {
 	return ed.index < other.index
 }
 
-func processEntry(prev, curr entryData) {
-	if prev.entry.Leaf.TimestampedEntry.Timestamp > 1000+curr.entry.Leaf.TimestampedEntry.Timestamp {
-		fmt.Println("Found out-of-order entry:")
-		fmt.Printf("  Index: %d\n", prev.index)
-		fmt.Printf("  Timestamps: %d, %d\n", prev.entry.Leaf.TimestampedEntry.Timestamp, curr.entry.Leaf.TimestampedEntry.Timestamp)
-		switch prev.entry.Leaf.TimestampedEntry.EntryType {
-		case ct.X509LogEntryType:
-			cert, err := prev.entry.Leaf.X509Certificate()
-			if err != nil {
-				fmt.Printf("  Failed to parse: %v\n", err)
-			} else {
-				fmt.Printf("  Serial: %d\n", cert.SerialNumber)
+func b64(h []byte) string {
+	return base64.StdEncoding.EncodeToString(h)
+}
+
+func runFetcher(fetcher *scanner.Fetcher) <-chan entryData {
+	entries := make(chan entryData)
+	go func() {
+		err := fetcher.Run(context.Background(), func(batch scanner.EntryBatch) {
+			for i, e := range batch.Entries {
+				h := sha256.New()
+				h.Write([]byte{0})
+				h.Write(e.LeafInput)
+				entries <- entryData{index: batch.Start + int64(i), merkleLeafHash: h.Sum(nil)}
 			}
-		case ct.PrecertLogEntryType:
-			cert, err := prev.entry.Leaf.Precertificate()
-			if err != nil {
-				fmt.Printf("  Failed to parse: %v\n", err)
-			} else {
-				fmt.Printf("  Serial: %d\n", cert.SerialNumber)
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		close(entries)
+	}()
+	return entries
+}
+
+// runSorter starts a goroutine that reads entryData from its input, and emits
+// them in sorted order (by increasing index) on the output channel it returns.
+func runSorter(entries <-chan entryData) <-chan entryData {
+	sortedEntries := make(chan entryData)
+	buffer := NewHeap[entryData]()
+	go func() {
+		var nextIndex int64 = 0
+		for e := range entries {
+			buffer.Push(e)
+
+			for buffer.Len() > 0 && buffer.Peek().index == nextIndex {
+				e = buffer.Pop()
+				sortedEntries <- e
+				nextIndex += 1
 			}
 		}
+		close(sortedEntries)
+	}()
+	return sortedEntries
+}
+
+var fetchBackoff = &backoff.Backoff{
+	Min:    1 * time.Second,
+	Max:    30 * time.Second,
+	Factor: 2,
+	Jitter: true,
+}
+
+// verify requests `get-proof-by-hash` for a given entry and calculates the
+// root hash based on the returned audit_path plus the entry's hash. It then
+// compares that against a root hash calculated by another method. This
+// provides a way to do partial consistency checks along the way to verifying
+// a full root hash from scratch. It also ensures that if the log is serving
+// get-proof-by-hash requests using precalculated hashes, those precalculated
+// hashes have not been corrupted.
+func verify(logClient *client.LogClient, e entryData, rootHash []byte) error {
+	currentTreeSize := e.index + 1
+
+	var pbh *ct.GetProofByHashResponse
+	err := fetchBackoff.Retry(context.Background(), func() error {
+		var err error
+		pbh, err = logClient.GetProofByHash(context.Background(), e.merkleLeafHash, uint64(currentTreeSize))
+		if err != nil {
+			var netError net.Error
+			var rspError jsonclient.RspError
+			if (errors.As(err, &netError) && netError.Timeout()) ||
+				errors.As(err, &rspError) && rspError.StatusCode > 500 {
+				log.Printf("get-proof-by-hash: %s (retrying)", err)
+				return backoff.RetriableErrorf("%w", err)
+			}
+			return fmt.Errorf("getting proof by hash: %#v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatal(err)
 	}
+
+	verifier := merkle.NewLogVerifier(rfc6962.DefaultHasher)
+	err = verifier.VerifyInclusion(uint64(e.index), uint64(currentTreeSize), e.merkleLeafHash, pbh.AuditPath, rootHash)
+	if err != nil {
+		var auditPathPrintable []string
+		for _, h := range pbh.AuditPath {
+			auditPathPrintable = append(auditPathPrintable, b64(h))
+		}
+		return fmt.Errorf("verify failed: VerifyInclusionProof(%d, %d, %s, %s, %s)=%w",
+			e.index, currentTreeSize, auditPathPrintable,
+			b64(rootHash), b64(e.merkleLeafHash), err)
+	}
+	return nil
 }
 
 func main() {
-	logURI := flag.String("log_uri", "https://oak.ct.letsencrypt.org/2022/", "CT log base URI")
-	batchSize := flag.Int("batch_size", 256, "Max number of entries to request at per call to get-entries")
+	logURI := flag.String("log_uri", "", "CT log base URI")
+	batchSize := flag.Int("batch_size", 256, "Max number of entries to request per call to get-entries")
 	numWorkers := flag.Int("num_workers", 2, "Number of concurrent workers")
-	startIndex := flag.Int64("start_index", 0, "Log index to start scanning at")
-	endIndex := flag.Int64("end_index", 0, "Log index to end scanning at (non-inclusive, 0 = end of log)")
+	flag.Usage = func() {
+		fmt.Print(`This tool gets the current STH of a log, then fetches all
+entries up to that STH's tree_size, building the root hash as it goes. If the
+root hash doesn't match, it exits with an error.
+
+It also checks get-proof-by-hash along the way, builds the implied root hash
+from the response, and checks that it matches the currently calculated root.
+If there's a mismatch, this tool exits with an error.
+
+`)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
+
+	if *logURI == "" {
+		log.Fatal("must provide the -log_uri flag")
+	}
 
 	logClient, err := client.New(*logURI, &http.Client{
 		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			MaxIdleConnsPerHost:   10,
-			DisableKeepAlives:     false,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
 	}, jsonclient.Options{UserAgent: "le-ct-crawler/0.1"})
 	if err != nil {
-		log.Fatal("Failed to create log client")
+		log.Fatalf("creating log client: %s", err)
 	}
+
+	// Fetch whatever the log is serving as the current STH. Currently we just
+	// trust the contents; we don't verify the signature.
+	sth, err := logClient.GetSTH(context.Background())
+	if err != nil {
+		log.Fatalf("getting STH: %s", err)
+	}
+
+	log.Printf("verifying tree integrity at size %d (%s) with root hash %s", sth.TreeSize,
+		time.UnixMilli(int64(sth.Timestamp)), sth.SHA256RootHash.Base64String())
+	endIndex := int64(sth.TreeSize)
 
 	fetcher := scanner.NewFetcher(
 		logClient,
 		&scanner.FetcherOptions{
 			BatchSize:     *batchSize,
-			StartIndex:    *startIndex,
-			EndIndex:      *endIndex,
+			StartIndex:    0,
+			EndIndex:      endIndex,
 			ParallelFetch: *numWorkers,
 			Continuous:    false,
 		},
 	)
 
-	// Create a callback that sends fetched entries to a channel to be processed.
-	entries := make(chan entryData)
-	processBatch := func(batch scanner.EntryBatch) {
-		for i, e := range batch.Entries {
-			index := batch.Start + int64(i)
-			rawLogEntry, err := ct.RawLogEntryFromLeaf(index, &e)
-			if err != nil {
-				fmt.Printf("failed to process entry at index %d: %v\n", index, err)
-				continue
-			}
-			entries <- entryData{index: batch.Start + int64(i), entry: rawLogEntry}
+	// Fetch the entries as fast as possible
+	entries := runFetcher(fetcher)
+	// Filter them into sorted order
+	sortedEntries := runSorter(entries)
+
+	compactRange := (&compact.RangeFactory{Hash: rfc6962.DefaultHasher.HashChildren}).NewEmptyRange(0)
+
+	start := time.Now()
+	var rootHash []byte
+	var e entryData
+	for e = range sortedEntries {
+		compactRange.Append(e.merkleLeafHash, nil)
+		rootHash, err = compactRange.GetRootHash(nil)
+		if err != nil {
+			// The only way this could happen is if we didn't start
+			// the range at 0, which we definitely did.
+			log.Fatalf("index %d: %s", e.index, err)
 		}
-	}
+		elapsed := time.Since(start).Seconds()
+		fraction := float64(e.index) / float64(endIndex)
+		rate := time.Duration(float64(e.index) / float64(elapsed))
+		var eta time.Duration
+		if rate > 0 {
+			eta = time.Duration(endIndex-e.index) / rate * time.Second
+		}
 
-	// Start a worker which reads entries from the fetchers. If it receives an
-	// entry for which it has not already processed the immediately preceding
-	// entry, it buffers it and waits to process it until the intervening entries
-	// have been backfilled. When processing an entry, it compares it to the
-	// immediately prior entry: if the timestamp has traveled backwards in time,
-	// it outputs the *prior* entry, on the assumption that its timestamp was
-	// incorrectly forward in time.
-	buffer := NewHeap[entryData]()
-	nextIndex := *startIndex
-	last := entryData{index: -1}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for e := range entries {
-			// If it's not the entry we want, save it for later.
-			if e.index != nextIndex {
-				buffer.Push(e)
-				continue
-			}
+		// Sample by a medium-sized prime number so we're not always verifying
+		// at even-length tree sizes; this might give us more coverage of
+		// different kinds of paths through the tree.
+		if e.index%98689 == 0 {
+			log.Printf("index %d of %d; %2.1f%%; ETA %s; leaf %s; root %s",
+				e.index, endIndex, fraction*100, eta,
+				b64(e.merkleLeafHash), b64(rootHash))
 
-			// If this is the first entry we're looking for, initialize our last-seen
-			// tracker so we have a basis for comparison.
-			if last.index == -1 {
-				last = e
-				nextIndex = e.index + 1
-				continue
-			}
-
-			// This is the next entry we were looking for. Process it.
-			processEntry(last, e)
-			last = e
-			nextIndex += 1
-			if nextIndex%1000 == 0 {
-				fmt.Printf("Processed up to index %d\n", nextIndex)
-			}
-
-			// Try to process the buffer, just in case we've caught up to it.
-			for buffer.Len() > 0 && buffer.Peek().index == nextIndex {
-				e = buffer.Pop()
-				processEntry(last, e)
-				last = e
-				nextIndex += 1
-				if nextIndex%1000 == 0 {
-					fmt.Printf("Processed up to index %d\n", nextIndex)
+			go func(e entryData, rootHash []byte) {
+				err := verify(logClient, e, rootHash)
+				if err != nil {
+					log.Fatal(err)
 				}
-			}
+			}(e, rootHash)
 		}
-	}()
-
-	// Set up a context and a signal-catcher to cancel the context so we can
-	// break out cleanly if we need to.
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGTERM)
-		signal.Notify(sigChan, syscall.SIGINT)
-		signal.Notify(sigChan, syscall.SIGHUP)
-
-		<-sigChan
-		cancel()
-
-		os.Exit(0)
-	}()
-
-	// Finally, run the fetcher, letting it feed data into the worker above.
-	err = fetcher.Run(ctx, processBatch)
-	close(entries)
-	wg.Wait()
-	if err != nil {
-		log.Fatal(err)
 	}
+	if e.index != endIndex-1 {
+		log.Printf("channel closed early? processed %d entries; expected %d", e.index, endIndex)
+	}
+	log.Printf("final entry %d. Elapsed %s. Root hash %s",
+		e.index, time.Since(start), b64(rootHash))
+	if !bytes.Equal(rootHash, sth.SHA256RootHash[:]) {
+		log.Fatalf(
+			"calculated root hash of %s differed from log's reported root hash at tree size %d: calculated %s, log reported %s",
+			*logURI,
+			sth.TreeSize,
+			b64(rootHash),
+			b64(sth.SHA256RootHash[:]))
+	}
+	log.Printf(
+		"success: calculated root hash of %s at tree size %d was an exact match for get-sth: %s",
+		*logURI,
+		sth.TreeSize,
+		b64(rootHash))
 }
